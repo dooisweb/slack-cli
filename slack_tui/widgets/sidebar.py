@@ -55,7 +55,7 @@ class ChannelListItem(ListItem):
             lbl.styles.text_style = "bold"
         else:
             lbl.update(f"  {self._base_label}")
-            lbl.styles.text_style = ""
+            lbl.styles.text_style = "none"
 
 
 class Sidebar(ListView):

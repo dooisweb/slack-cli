@@ -5,7 +5,7 @@ import logging
 import os
 from pathlib import Path
 
-from slack_tui.models import Channel, ChannelType, Message, User
+from slack_tui.models import Channel, ChannelType, FileAttachment, Message, User
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +110,16 @@ def save_history(channel_id: str, messages: list[Message]) -> None:
             "user_name": m.user_name,
             "text": m.text,
             "timestamp": m.timestamp,
+            "files": [
+                {
+                    "id": f.id,
+                    "name": f.name,
+                    "mimetype": f.mimetype,
+                    "size": f.size,
+                    "url_private": f.url_private,
+                }
+                for f in m.files
+            ],
         }
         for m in messages
     ]
@@ -130,6 +140,16 @@ def load_history(channel_id: str) -> list[Message] | None:
                 user_name=item["user_name"],
                 text=item["text"],
                 timestamp=item["timestamp"],
+                files=[
+                    FileAttachment(
+                        id=f["id"],
+                        name=f["name"],
+                        mimetype=f["mimetype"],
+                        size=f["size"],
+                        url_private=f["url_private"],
+                    )
+                    for f in item.get("files", [])
+                ],
             )
             for item in data
         ]

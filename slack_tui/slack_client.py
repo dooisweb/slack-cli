@@ -1,12 +1,29 @@
 """Async Slack API wrapper for channels, messages, and users."""
 
+import asyncio
 import logging
 
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from slack_tui.models import Channel, ChannelType, Message, User
+log = logging.getLogger(__name__)
+
+from slack_tui.models import Channel, ChannelType, FileAttachment, Message, User
 from slack_tui import cache as disk_cache
+
+
+async def _rate_limit_retry(coro_fn, max_retries: int = 2):
+    """Call an async function, retrying on rate limit (429) errors."""
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_fn()
+        except SlackApiError as e:
+            if e.response.status_code == 429 and attempt < max_retries:
+                retry_after = int(e.response.headers.get("Retry-After", 5))
+                log.warning("Rate limited, retrying in %ds", retry_after)
+                await asyncio.sleep(retry_after)
+            else:
+                raise
 
 
 class SlackClient:
@@ -29,14 +46,21 @@ class SlackClient:
             if cursor:
                 kwargs["cursor"] = cursor
 
-            response = await self.web_client.conversations_list(**kwargs)
+            response = await _rate_limit_retry(
+                lambda kw=dict(kwargs): self.web_client.conversations_list(**kw)
+            )
             for conv in response.get("channels", []):
+                # updated is in milliseconds; convert to seconds
+                updated = float(conv.get("updated", 0))
+                if updated > 1e12:
+                    updated = updated / 1000.0
                 ch = Channel(
                     id=conv["id"],
                     name=conv.get("name", conv["id"]),
                     channel_type=ChannelType(self._resolve_channel_type(conv)),
                     is_member=conv.get("is_member", False),
                     user_id=conv.get("user"),
+                    last_activity=updated,
                 )
                 channels.append(ch)
 
@@ -45,6 +69,22 @@ class SlackClient:
                 break
 
         return channels
+
+    @staticmethod
+    def _parse_image_files(msg: dict) -> list[FileAttachment]:
+        """Extract image file attachments from a Slack message."""
+        files = []
+        for f in msg.get("files", []):
+            mime = f.get("mimetype", "")
+            if mime.startswith("image/"):
+                files.append(FileAttachment(
+                    id=f["id"],
+                    name=f.get("name", "image"),
+                    mimetype=mime,
+                    size=f.get("size", 0),
+                    url_private=f.get("url_private", ""),
+                ))
+        return files
 
     def _resolve_channel_type(self, conv: dict) -> str:
         if conv.get("is_im"):
@@ -57,8 +97,8 @@ class SlackClient:
 
     async def fetch_history(self, channel_id: str, limit: int = 50) -> list[Message]:
         """Fetch recent messages for a channel, oldest first."""
-        response = await self.web_client.conversations_history(
-            channel=channel_id, limit=limit
+        response = await _rate_limit_retry(
+            lambda: self.web_client.conversations_history(channel=channel_id, limit=limit)
         )
         messages: list[Message] = []
         for msg in response.get("messages", []):
@@ -75,6 +115,7 @@ class SlackClient:
                     user_name=user_name,
                     text=msg.get("text", ""),
                     timestamp=float(ts.split(".")[0]),
+                    files=self._parse_image_files(msg),
                 )
             )
 
@@ -83,8 +124,10 @@ class SlackClient:
 
     async def fetch_new_messages(self, channel_id: str, oldest_ts: str) -> list[Message]:
         """Fetch messages newer than oldest_ts, oldest first."""
-        response = await self.web_client.conversations_history(
-            channel=channel_id, oldest=oldest_ts, inclusive=False, limit=100
+        response = await _rate_limit_retry(
+            lambda: self.web_client.conversations_history(
+                channel=channel_id, oldest=oldest_ts, inclusive=False, limit=100
+            )
         )
         messages: list[Message] = []
         for msg in response.get("messages", []):
@@ -101,6 +144,7 @@ class SlackClient:
                     user_name=user_name,
                     text=msg.get("text", ""),
                     timestamp=float(ts.split(".")[0]),
+                    files=self._parse_image_files(msg),
                 )
             )
         messages.reverse()
@@ -122,7 +166,9 @@ class SlackClient:
             return self._user_cache[user_id].display_name
 
         try:
-            response = await self.web_client.users_info(user=user_id)
+            response = await _rate_limit_retry(
+                lambda: self.web_client.users_info(user=user_id)
+            )
             user_data = response["user"]
             profile = user_data.get("profile", {})
             display_name = (
@@ -164,6 +210,20 @@ class SlackClient:
         except SlackApiError:
             pass
         return 0.0
+
+    async def download_file(self, url: str) -> bytes | None:
+        """Download a file from Slack using auth headers."""
+        import aiohttp
+        headers = {"Authorization": f"Bearer {self.web_client.token}"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        return await resp.read()
+                    log.error("Download failed: %s %s", resp.status, url)
+        except Exception as e:
+            log.error("Download error: %s", e)
+        return None
 
     async def resolve_dm_name(self, channel: Channel) -> str:
         """For DM channels, resolve the other user's display name."""

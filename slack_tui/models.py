@@ -1,6 +1,6 @@
 """Data models for Slack entities."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -30,6 +30,15 @@ class User:
 
 
 @dataclass
+class FileAttachment:
+    id: str
+    name: str
+    mimetype: str
+    size: int  # bytes
+    url_private: str  # requires auth to download
+
+
+@dataclass
 class Message:
     ts: str  # Slack timestamp (unique message ID)
     channel_id: str
@@ -37,3 +46,4 @@ class Message:
     user_name: str  # Resolved display name
     text: str
     timestamp: float  # Unix timestamp for display formatting
+    files: list[FileAttachment] = field(default_factory=list)

@@ -1,0 +1,81 @@
+Screen {
+    layout: horizontal;
+}
+
+#sidebar {
+    width: 30;
+    min-width: 20;
+    dock: left;
+    border-right: solid $accent;
+    background: $surface;
+}
+
+#sidebar > .listview--item {
+    padding: 0 1;
+}
+
+CategoryHeader {
+    background: $surface-darken-1;
+    text-style: bold;
+    color: $text-muted;
+    height: 1;
+}
+
+CategoryHeader:hover {
+    background: $surface-darken-2;
+}
+
+ChatPanel {
+    width: 1fr;
+    layout: vertical;
+}
+
+#message-view {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#message-input {
+    height: 3;
+    dock: bottom;
+    border-top: solid $accent;
+}
+
+Header {
+    dock: top;
+}
+
+Footer {
+    dock: bottom;
+}
+
+/* Auth screen modal */
+AuthScreen {
+    align: center middle;
+}
+
+#auth-dialog {
+    width: 70;
+    height: auto;
+    padding: 2 4;
+    background: $surface;
+    border: thick $accent;
+}
+
+#auth-dialog Label {
+    margin: 1 0 0 0;
+}
+
+#auth-dialog .auth-title {
+    text-style: bold;
+    margin: 0 0 1 0;
+}
+
+#auth-buttons {
+    margin: 2 0 0 0;
+    align: center middle;
+}
+
+#auth-buttons Button {
+    margin: 0 2;
+}

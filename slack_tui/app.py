@@ -127,6 +127,16 @@ class SlackTuiApp(App):
             cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).timestamp()
             channels = [c for c in channels if c.last_activity >= cutoff]
 
+            # Merge cached last_activity values — the cache may have more
+            # accurate timestamps from previous sessions (updated when history
+            # was loaded or messages were sent/received).
+            cached_chs = disk_cache.load_channels()
+            cached_by_id = {c.id: c.last_activity for c in (cached_chs or [])}
+            for ch in channels:
+                cached_ts = cached_by_id.get(ch.id, 0.0)
+                if cached_ts > ch.last_activity:
+                    ch.last_activity = cached_ts
+
             self._all_channels = channels
 
             # Seed last-seen timestamps from current time so only messages
@@ -181,6 +191,16 @@ class SlackTuiApp(App):
                 self._last_message_ts = messages[-1].ts
                 self._channel_last_ts[channel_id] = messages[-1].ts
                 disk_cache.save_history(channel_id, messages)
+                # Update channel's last_activity from the actual last
+                # message timestamp — much more accurate than the API's
+                # `updated` field.
+                last_msg_ts = float(messages[-1].ts)
+                for ch in self._all_channels:
+                    if ch.id == channel_id:
+                        if last_msg_ts > ch.last_activity:
+                            ch.last_activity = last_msg_ts
+                        break
+                disk_cache.save_channels(self._all_channels)
                 # Download images in background
                 self._download_images(messages)
         except Exception as e:
@@ -301,19 +321,35 @@ class SlackTuiApp(App):
     def _complete_channel_name(self, prefix: str) -> list[tuple[str, str]]:
         """Return channel/user completions for /msg."""
         search = prefix.lstrip("@#").lower()
-        results: list[tuple[str, str]] = []
+        is_at_prefix = not prefix.startswith("#")
+        dm_results: list[tuple[str, str]] = []
+        mpdm_results: list[tuple[str, str]] = []
+        channel_results: list[tuple[str, str]] = []
         for ch in self._all_channels:
-            if search and not ch.name.lower().startswith(search):
-                continue
-            if ch.channel_type in (ChannelType.DM, ChannelType.MPDM):
-                results.append((f"/msg @{ch.name}", "DM"))
+            if ch.channel_type == ChannelType.DM:
+                if search and not ch.name.lower().startswith(search):
+                    continue
+                dm_results.append((f"/msg @{ch.name}", "DM"))
+            elif ch.channel_type == ChannelType.MPDM:
+                # For MPDMs, require the search to match the full MPDM name,
+                # not just a single member within it
+                if search and not ch.name.lower().startswith(search):
+                    continue
+                mpdm_results.append((f"/msg @{ch.name}", "group DM"))
             elif ch.channel_type == ChannelType.PRIVATE:
-                results.append((f"/msg #{ch.name}", "private"))
+                if search and not ch.name.lower().startswith(search):
+                    continue
+                channel_results.append((f"/msg #{ch.name}", "private"))
             else:
-                results.append((f"/msg #{ch.name}", "channel"))
-            if len(results) >= 10:
-                break
-        return results
+                if search and not ch.name.lower().startswith(search):
+                    continue
+                channel_results.append((f"/msg #{ch.name}", "channel"))
+        # Prioritize DMs first when prefix starts with @ (no #)
+        if is_at_prefix:
+            results = dm_results + mpdm_results + channel_results
+        else:
+            results = channel_results + dm_results + mpdm_results
+        return results[:10]
 
     def on_message_input_message_submitted(self, event: MessageInput.MessageSubmitted) -> None:
         # Dismiss autocomplete on submit
@@ -381,8 +417,13 @@ class SlackTuiApp(App):
             return
         # Strip leading @ or #
         search = name.lstrip("@#").lower()
+        # Prioritize 1:1 DMs (exact match) over MPDMs and channels
         for ch in self._all_channels:
-            if ch.name.lower() == search:
+            if ch.channel_type == ChannelType.DM and ch.name.lower() == search:
+                self._select_channel(ch)
+                return
+        for ch in self._all_channels:
+            if ch.channel_type != ChannelType.DM and ch.name.lower() == search:
                 self._select_channel(ch)
                 return
         self.notify(f"No channel or user found matching '{name}'", severity="warning", timeout=5)
@@ -555,6 +596,12 @@ class SlackTuiApp(App):
             self.sub_title = self.current_channel.name
             self._load_history()
 
+    def on_message_view_thread_close_request(
+        self, event: MessageView.ThreadCloseRequest
+    ) -> None:
+        """Handle clicking '< Close Thread' in thread view."""
+        self._exit_thread_view()
+
     def on_message_view_thread_view_request(
         self, event: MessageView.ThreadViewRequest
     ) -> None:
@@ -578,7 +625,7 @@ class SlackTuiApp(App):
 
     @work(exclusive=False, group="images")
     async def _download_images(self, messages: list[Message]) -> None:
-        """Download image attachments and render them as ASCII art."""
+        """Download image attachments into cache (for [Open] click handler)."""
         assert self.slack_client is not None
         msg_view = self.query_one("#message-view", MessageView)
         for message in messages:
@@ -587,16 +634,16 @@ class SlackTuiApp(App):
                     continue
                 data = await self.slack_client.download_file(file.url_private, file.id)
                 if data:
-                    msg_view.render_image_attachment(file, data)
+                    msg_view._image_cache[file.id] = data
 
     @work(exclusive=False, group="images")
     async def _download_single_image(self, file: FileAttachment) -> None:
-        """Download and render a single image attachment."""
+        """Download a single image attachment into cache."""
         assert self.slack_client is not None
         msg_view = self.query_one("#message-view", MessageView)
         data = await self.slack_client.download_file(file.url_private, file.id)
         if data:
-            msg_view.render_image_attachment(file, data)
+            msg_view._image_cache[file.id] = data
 
     def _bump_channel_activity(self, channel_id: str) -> None:
         """Update a channel's last_activity and move it to the top of its sidebar category."""
@@ -607,6 +654,9 @@ class SlackTuiApp(App):
                 break
         sidebar = self.query_one("#sidebar", Sidebar)
         sidebar.move_to_top(channel_id)
+        # Persist updated timestamps so the next session starts with
+        # accurate ordering (this is cheap — just a JSON write).
+        disk_cache.save_channels(self._all_channels)
 
     def on_new_slack_message(self, event: NewSlackMessage) -> None:
         channel_id = event.message.channel_id

@@ -105,6 +105,7 @@ _LINK_PREFIX = "open:"
 _IMAGE_PREFIX = "img:"
 _SEARCH_NAV_PREFIX = "searchnav:"
 _THREAD_PREFIX = "thread:"
+_THREAD_CLOSE_PREFIX = "threadclose:"
 
 
 def _date_label(dt: datetime) -> str:
@@ -179,6 +180,10 @@ class MessageView(RichLog):
             self.thread_ts = thread_ts
             super().__init__()
 
+    class ThreadCloseRequest(TextualMessage):
+        """Posted when the user clicks '< Close Thread'."""
+        pass
+
     class SearchNavigateRequest(TextualMessage):
         """Posted when the user clicks a channel name in search results."""
 
@@ -242,6 +247,8 @@ class MessageView(RichLog):
         elif style.link.startswith(_THREAD_PREFIX):
             thread_ts = style.link[len(_THREAD_PREFIX):]
             self.post_message(self.ThreadViewRequest(thread_ts))
+        elif style.link.startswith(_THREAD_CLOSE_PREFIX):
+            self.post_message(self.ThreadCloseRequest())
         elif style.link.startswith(_SEARCH_NAV_PREFIX):
             encoded_id = style.link[len(_SEARCH_NAV_PREFIX):]
             try:
@@ -278,44 +285,6 @@ class MessageView(RichLog):
                     continue
         webbrowser.open(f"file://{path}")
 
-    def render_image_attachment(self, file: FileAttachment, image_data: bytes) -> None:
-        """Render an image as ASCII art inline."""
-        import logging
-        from slack_tui.image_render import render_image
-
-        log = logging.getLogger(__name__)
-        self._image_cache[file.id] = image_data
-
-        # Header line: filename + size + clickable [View]
-        header = Text()
-        header.append("    [img] ", style="dim")
-        header.append(file.name, style="italic")
-        header.append(f" ({human_size(file.size)})  ", style="dim")
-        header.append(
-            "[Open]",
-            style=Style(bold=True, color="blue", underline=True,
-                        link=f"{_IMAGE_PREFIX}{file.id}"),
-        )
-        self.write(header)
-
-        # Render ASCII art
-        try:
-            art = render_image(image_data)
-            self.write(art)
-        except Exception as e:
-            log.error("Image render failed for %s: %s (data size: %d, first bytes: %s)",
-                      file.name, e, len(image_data), image_data[:50])
-            self.write(Text("    (could not render image)", style="dim italic"))
-
-    def show_image_placeholder(self, file: FileAttachment) -> None:
-        """Show a placeholder for an image that hasn't been downloaded yet."""
-        line = Text()
-        line.append("    [img] ", style="dim")
-        line.append(file.name, style="italic")
-        line.append(f" ({human_size(file.size)})", style="dim")
-        line.append("  loading...", style="dim italic")
-        self.write(line)
-
     def _is_continuation(self, message: Message) -> bool:
         """Check if this message continues a group from the same user."""
         if self._last_user_id != message.user_id:
@@ -349,23 +318,28 @@ class MessageView(RichLog):
         self._last_user_id = message.user_id
         self._last_timestamp = message.timestamp
 
-        # Show placeholders for image attachments (actual rendering happens async)
+        # Show inline placeholder for image attachments (images open from cache via [Open])
         for file in message.files:
-            if file.id in self._image_cache:
-                self.render_image_attachment(file, self._image_cache[file.id])
-            else:
-                self.show_image_placeholder(file)
+            line = Text()
+            line.append("    [img] ", style="dim")
+            line.append(file.name, style="italic")
+            line.append(f" ({human_size(file.size)})  ", style="dim")
+            line.append(
+                "[Open]",
+                style=Style(bold=True, color="blue", underline=True,
+                            link=f"{_IMAGE_PREFIX}{file.id}"),
+            )
+            self.write(line)
 
         # Thread indicator for messages with replies
         if message.reply_count > 0:
             thread_line = Text()
             n = message.reply_count
             label = "1 reply" if n == 1 else f"{n} replies"
-            thread_line.append(f"    \u21b3 {label}  ", style="dim italic")
             thread_line.append(
-                "[View Thread]",
+                f"    View Thread ({label})",
                 style=Style(
-                    bold=True, color="cyan", underline=True,
+                    bold=True, color="blue", underline=True,
                     link=f"{_THREAD_PREFIX}{message.ts}",
                 ),
             )
@@ -377,6 +351,17 @@ class MessageView(RichLog):
         self._last_date_label = None
         self._last_user_id = None
         self._last_timestamp = 0.0
+        # Clickable "< Close Thread" link at the top
+        close_line = Text()
+        close_line.append(
+            "< Close Thread",
+            style=Style(
+                bold=True, underline=True,
+                link=f"{_THREAD_CLOSE_PREFIX}close",
+            ),
+        )
+        self.write(close_line)
+        self.write(Text(""))
         header = Text()
         header.append("Thread", style="bold cyan")
         preview = parent_text[:80] + ("..." if len(parent_text) > 80 else "")
@@ -385,11 +370,6 @@ class MessageView(RichLog):
         sep = Text()
         sep.append("─" * 50, style="dim cyan")
         self.write(sep)
-        back = Text()
-        back.append("  Press ", style="dim")
-        back.append("Escape", style="bold")
-        back.append(" to go back to channel", style="dim")
-        self.write(back)
         self.write(Text(""))
 
     def load_history(self, messages: list[Message]) -> None:

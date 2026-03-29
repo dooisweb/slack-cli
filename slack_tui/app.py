@@ -121,21 +121,39 @@ class SlackTuiApp(App):
                 elif ch.channel_type == ChannelType.MPDM:
                     ch.name = await self.slack_client.resolve_mpdm_name(ch, own_user_id)
 
+            # Fetch actual last message timestamps for DM and MPDM channels.
+            # These are few enough (typically 20-30) to fetch without rate
+            # limit issues, and the API's `updated` field is unreliable for
+            # ordering DMs by recent activity.
+            dm_channels = [
+                ch for ch in channels
+                if ch.channel_type in (ChannelType.DM, ChannelType.MPDM)
+            ]
+            if dm_channels:
+                dm_ids = [ch.id for ch in dm_channels]
+                last_ts_map = await self.slack_client.fetch_last_message_ts_batch(
+                    dm_ids, batch_size=5, delay=1.0
+                )
+                for ch in dm_channels:
+                    fetched_ts = last_ts_map.get(ch.id, 0.0)
+                    if fetched_ts > 0.0:
+                        ch.last_activity = fetched_ts
+
+            # Debug: log top 10 DMs with their ordering values
+            dm_sorted = sorted(dm_channels, key=lambda c: -c.last_activity)
+            for i, ch in enumerate(dm_sorted[:10]):
+                logging.debug(
+                    "DM ordering [%d]: %s (id=%s) last_activity=%.1f (%s)",
+                    i, ch.name, ch.id, ch.last_activity,
+                    datetime.fromtimestamp(ch.last_activity, tz=timezone.utc).isoformat()
+                    if ch.last_activity > 0 else "never",
+                )
+
             # Filter out channels with no activity in the last 90 days
-            # (using `updated` field from API — not perfectly accurate, so
-            # we use a generous window to avoid hiding active channels)
+            # (using `updated` field from API for non-DM channels, actual
+            # last message time for DMs — use a generous window)
             cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).timestamp()
             channels = [c for c in channels if c.last_activity >= cutoff]
-
-            # Merge cached last_activity values — the cache may have more
-            # accurate timestamps from previous sessions (updated when history
-            # was loaded or messages were sent/received).
-            cached_chs = disk_cache.load_channels()
-            cached_by_id = {c.id: c.last_activity for c in (cached_chs or [])}
-            for ch in channels:
-                cached_ts = cached_by_id.get(ch.id, 0.0)
-                if cached_ts > ch.last_activity:
-                    ch.last_activity = cached_ts
 
             self._all_channels = channels
 
@@ -186,7 +204,6 @@ class SlackTuiApp(App):
         # Fetch fresh history from API
         try:
             messages = await self.slack_client.fetch_history(channel_id)
-            msg_view.load_history(messages)
             if messages:
                 self._last_message_ts = messages[-1].ts
                 self._channel_last_ts[channel_id] = messages[-1].ts
@@ -201,7 +218,13 @@ class SlackTuiApp(App):
                             ch.last_activity = last_msg_ts
                         break
                 disk_cache.save_channels(self._all_channels)
-                # Download images in background
+                # Download uncached images BEFORE rendering so ASCII art
+                # appears inline in the correct position.
+                await self._prefetch_images(messages, msg_view)
+            # Render history (images already in cache will show inline)
+            msg_view.load_history(messages)
+            if messages:
+                # Kick off background download for any that failed/were skipped
                 self._download_images(messages)
         except Exception as e:
             self.notify(f"Failed to load history: {e}", severity="error")
@@ -571,12 +594,14 @@ class SlackTuiApp(App):
             messages = await self.slack_client.fetch_thread(channel_id, thread_ts)
             self._thread_messages = messages
             msg_view = self.query_one("#message-view", MessageView)
-            # Re-show thread header then append all messages
+            # Prefetch images so ASCII art renders inline
             if messages:
+                await self._prefetch_images(messages, msg_view)
                 msg_view.show_thread_header(messages[0].text)
                 for msg in messages:
                     msg_view.append_message(msg)
                 self._thread_last_ts = messages[-1].ts
+                # Background download for any that failed
                 self._download_images(messages)
         except Exception as e:
             self.notify(f"Failed to load thread: {e}", severity="error")
@@ -622,6 +647,20 @@ class SlackTuiApp(App):
         """Escape key handler — exit thread view if active."""
         if self._current_thread_ts:
             self._exit_thread_view()
+
+    async def _prefetch_images(self, messages: list[Message], msg_view: MessageView) -> None:
+        """Download uncached images so they can render inline during history load."""
+        assert self.slack_client is not None
+        for message in messages:
+            for file in message.files:
+                if file.id in msg_view._image_cache:
+                    continue
+                try:
+                    data = await self.slack_client.download_file(file.url_private, file.id)
+                    if data:
+                        msg_view._image_cache[file.id] = data
+                except Exception:
+                    pass  # will show placeholder; background worker can retry
 
     @work(exclusive=False, group="images")
     async def _download_images(self, messages: list[Message]) -> None:

@@ -14,7 +14,7 @@ from textual.events import Click
 from textual.message import Message as TextualMessage
 from textual.widgets import RichLog
 
-from slack_tui.image_render import human_size
+from slack_tui.image_render import human_size, render_image
 from slack_tui.models import FileAttachment, Message, SearchResult
 
 # Rotating palette for user name colors
@@ -173,6 +173,8 @@ def _format_text_with_links(text: str) -> Text:
 class MessageView(RichLog):
     """Scrollable message history display."""
 
+    ALLOW_SELECT = True
+
     class ThreadViewRequest(TextualMessage):
         """Posted when the user clicks [View Thread]."""
 
@@ -330,6 +332,13 @@ class MessageView(RichLog):
                             link=f"{_IMAGE_PREFIX}{file.id}"),
             )
             self.write(line)
+            # Render ASCII art inline if the image is already cached
+            if file.id in self._image_cache:
+                try:
+                    art = render_image(self._image_cache[file.id])
+                    self.write(art)
+                except Exception:
+                    pass  # corrupted/unsupported image — just show placeholder
 
         # Thread indicator for messages with replies
         if message.reply_count > 0:

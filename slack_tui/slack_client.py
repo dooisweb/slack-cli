@@ -248,8 +248,10 @@ class SlackClient:
     async def fetch_last_message_ts(self, channel_id: str) -> float:
         """Fetch the timestamp of the most recent message in a channel."""
         try:
-            response = await self.web_client.conversations_history(
-                channel=channel_id, limit=1
+            response = await _rate_limit_retry(
+                lambda cid=channel_id: self.web_client.conversations_history(
+                    channel=cid, limit=1
+                )
             )
             messages = response.get("messages", [])
             if messages:
@@ -257,6 +259,30 @@ class SlackClient:
         except SlackApiError:
             pass
         return 0.0
+
+    async def fetch_last_message_ts_batch(
+        self, channel_ids: list[str], batch_size: int = 5, delay: float = 1.0
+    ) -> dict[str, float]:
+        """Fetch last message timestamps for multiple channels in batches.
+
+        Returns a mapping of channel_id -> last_message_timestamp (epoch seconds).
+        Channels with no messages or API errors get 0.0.
+        """
+        results: dict[str, float] = {}
+        for i in range(0, len(channel_ids), batch_size):
+            batch = channel_ids[i : i + batch_size]
+            tasks = [self.fetch_last_message_ts(cid) for cid in batch]
+            timestamps = await asyncio.gather(*tasks, return_exceptions=True)
+            for cid, ts in zip(batch, timestamps):
+                if isinstance(ts, Exception):
+                    log.warning("Failed to fetch last_message_ts for %s: %s", cid, ts)
+                    results[cid] = 0.0
+                else:
+                    results[cid] = ts
+            # Rate-limit delay between batches (skip after the last batch)
+            if i + batch_size < len(channel_ids):
+                await asyncio.sleep(delay)
+        return results
 
     async def download_file(self, url: str, file_id: str | None = None) -> bytes | None:
         """Download a file from Slack.

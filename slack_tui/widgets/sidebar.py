@@ -125,6 +125,50 @@ class Sidebar(ListView):
                 child.set_unread(unread)
                 break
 
+    def move_to_top(self, channel_id: str) -> None:
+        """Move a channel to the top of its category (just after the header).
+
+        This provides a lightweight re-sort when a new message is sent or
+        received, without rebuilding the entire sidebar.
+        """
+        # Find the ChannelListItem for this channel
+        target: ChannelListItem | None = None
+        for child in self.children:
+            if isinstance(child, ChannelListItem) and child.channel.id == channel_id:
+                target = child
+                break
+        if target is None:
+            return
+
+        category_key = target.category_key
+        header = self._categories.get(category_key)
+        if header is None:
+            return
+
+        # Find the position right after the category header
+        header_index: int | None = None
+        for i, child in enumerate(self.children):
+            if child is header:
+                header_index = i
+                break
+        if header_index is None:
+            return
+
+        # The first item slot is header_index + 1
+        first_slot = header_index + 1
+
+        # Find current index of the target
+        target_index: int | None = None
+        for i, child in enumerate(self.children):
+            if child is target:
+                target_index = i
+                break
+        if target_index is None or target_index == first_slot:
+            # Already at the top of its category — nothing to do
+            return
+
+        self.move_child(target, before=first_slot)
+
     def _toggle_category_items(self, category_key: str, visible: bool) -> None:
         """Show or hide all channel items under a category."""
         for child in self.children:

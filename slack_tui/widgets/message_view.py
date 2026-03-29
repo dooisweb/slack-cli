@@ -130,7 +130,11 @@ class MessageView(RichLog):
 
     def on_click(self, event: Click) -> None:
         """Handle clicks on links and image view buttons."""
-        style = self.get_style_at(event.x, event.y)
+        import logging
+        log = logging.getLogger(__name__)
+        style = event.style
+        log.debug("Click at (%s,%s) style.link=%s", event.x, event.y,
+                   getattr(style, 'link', None) if style else None)
         if not style or not style.link:
             return
 
@@ -147,23 +151,38 @@ class MessageView(RichLog):
 
     def _open_cached_image(self, file_id: str) -> None:
         """Open a cached image in the system viewer."""
+        import os
+        import shutil
+        import tempfile
         data = self._image_cache.get(file_id)
         if not data:
             return
-        import tempfile
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
             f.write(data)
             path = f.name
-        try:
-            subprocess.Popen(["xdg-open", path],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except FileNotFoundError:
-            webbrowser.open(f"file://{path}")
+        # Try dedicated image viewers first, fall back to xdg-open
+        viewers = ["eog", "feh", "display", "sxiv", "imv", "xdg-open"]
+        for viewer in viewers:
+            if shutil.which(viewer):
+                try:
+                    subprocess.Popen(
+                        [viewer, path],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    return
+                except Exception:
+                    continue
+        webbrowser.open(f"file://{path}")
 
     def render_image_attachment(self, file: FileAttachment, image_data: bytes) -> None:
         """Render an image as ASCII art inline."""
+        import logging
         from slack_tui.image_render import render_image
 
+        log = logging.getLogger(__name__)
         self._image_cache[file.id] = image_data
 
         # Header line: filename + size + clickable [View]
@@ -182,7 +201,9 @@ class MessageView(RichLog):
         try:
             art = render_image(image_data)
             self.write(art)
-        except Exception:
+        except Exception as e:
+            log.error("Image render failed for %s: %s (data size: %d, first bytes: %s)",
+                      file.name, e, len(image_data), image_data[:50])
             self.write(Text("    (could not render image)", style="dim italic"))
 
     def show_image_placeholder(self, file: FileAttachment) -> None:

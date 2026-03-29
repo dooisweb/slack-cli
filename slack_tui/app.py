@@ -121,10 +121,12 @@ class SlackTuiApp(App):
 
             self._all_channels = channels
 
-            # Seed last-seen timestamps for polling all channels
+            # Seed last-seen timestamps from current time so only messages
+            # arriving after startup trigger unread indicators
+            now_ts = str(time.time())
             for ch in channels:
-                if ch.id not in self._channel_last_ts and ch.last_activity > 0:
-                    self._channel_last_ts[ch.id] = str(ch.last_activity)
+                if ch.id not in self._channel_last_ts:
+                    self._channel_last_ts[ch.id] = now_ts
 
             # Start polling if not already running
             if not self._polling:
@@ -177,13 +179,16 @@ class SlackTuiApp(App):
 
     @work(exclusive=True, group="poll")
     async def _poll_messages(self) -> None:
-        """Poll current channel frequently, other channels in slow rotation."""
+        """Launch two concurrent polling loops."""
         assert self.slack_client is not None
-        bg_index = 0  # rotate through background channels
-        while True:
-            await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.gather(
+            self._poll_current_channel(),
+            self._poll_background_channels(),
+        )
 
-            # 1. Always poll the current channel
+    async def _poll_current_channel(self) -> None:
+        """Poll the active channel every POLL_INTERVAL seconds."""
+        while True:
             if self.current_channel:
                 last_ts = self._channel_last_ts.get(self.current_channel.id)
                 if last_ts:
@@ -196,29 +201,35 @@ class SlackTuiApp(App):
                             self.post_message(NewSlackMessage(msg))
                     except Exception:
                         pass
+            await asyncio.sleep(POLL_INTERVAL)
 
-            # 2. Check a small batch of other channels per cycle
+    async def _poll_background_channels(self) -> None:
+        """Rotate through non-current channels slowly."""
+        bg_index = 0
+        while True:
+            await asyncio.sleep(POLL_INTERVAL)
             others = [c for c in self._all_channels
                       if not self.current_channel or c.id != self.current_channel.id]
-            if others:
-                batch = []
-                for i in range(BACKGROUND_POLL_BATCH):
-                    idx = (bg_index + i) % len(others)
-                    batch.append(others[idx])
-                bg_index = (bg_index + BACKGROUND_POLL_BATCH) % len(others)
+            if not others:
+                continue
+            batch = []
+            for i in range(BACKGROUND_POLL_BATCH):
+                idx = (bg_index + i) % len(others)
+                batch.append(others[idx])
+            bg_index = (bg_index + BACKGROUND_POLL_BATCH) % len(others)
 
-                for ch in batch:
-                    last_ts = self._channel_last_ts.get(ch.id)
-                    if not last_ts:
-                        continue
-                    try:
-                        new_msgs = await self.slack_client.fetch_new_messages(ch.id, last_ts)
-                        for msg in new_msgs:
-                            self._channel_last_ts[ch.id] = msg.ts
-                            self.post_message(NewSlackMessage(msg))
-                    except Exception:
-                        pass
-                    await asyncio.sleep(BACKGROUND_POLL_DELAY)
+            for ch in batch:
+                last_ts = self._channel_last_ts.get(ch.id)
+                if not last_ts:
+                    continue
+                try:
+                    new_msgs = await self.slack_client.fetch_new_messages(ch.id, last_ts)
+                    for msg in new_msgs:
+                        self._channel_last_ts[ch.id] = msg.ts
+                        self.post_message(NewSlackMessage(msg))
+                except Exception:
+                    pass
+                await asyncio.sleep(BACKGROUND_POLL_DELAY)
 
     def on_message_input_autocomplete_request(self, event: MessageInput.AutocompleteRequest) -> None:
         """Generate autocomplete suggestions based on current input."""
@@ -284,6 +295,20 @@ class SlackTuiApp(App):
             self._handle_command(text)
             return
         if self.current_channel:
+            # Optimistic display — show immediately in the UI
+            now = time.time()
+            local_msg = Message(
+                ts=str(now),
+                channel_id=self.current_channel.id,
+                user_id="me",
+                user_name="You",
+                text=text,
+                timestamp=now,
+            )
+            msg_view = self.query_one("#message-view", MessageView)
+            msg_view.append_message(local_msg)
+            self._sent_texts.add(text)
+            self._bump_channel_activity(self.current_channel.id)
             self._send_message(self.current_channel.id, text)
 
     def _handle_command(self, text: str) -> None:
@@ -347,21 +372,6 @@ class SlackTuiApp(App):
     @work(exclusive=False, group="send")
     async def _send_message(self, channel_id: str, text: str) -> None:
         assert self.slack_client is not None
-        # Show message immediately (optimistic display)
-        now = time.time()
-        local_msg = Message(
-            ts=str(now),
-            channel_id=channel_id,
-            user_id="me",
-            user_name="You",
-            text=text,
-            timestamp=now,
-        )
-        if self.current_channel and channel_id == self.current_channel.id:
-            msg_view = self.query_one("#message-view", MessageView)
-            msg_view.append_message(local_msg)
-        self._sent_texts.add(text)
-        # Send to Slack
         success, error = await self.slack_client.send_message(channel_id, text)
         if not success:
             self.notify(f"Send failed: {error}", severity="error", timeout=5)
@@ -375,7 +385,7 @@ class SlackTuiApp(App):
             for file in message.files:
                 if file.id in msg_view._image_cache:
                     continue
-                data = await self.slack_client.download_file(file.url_private)
+                data = await self.slack_client.download_file(file.url_private, file.id)
                 if data:
                     msg_view.render_image_attachment(file, data)
 
@@ -384,9 +394,19 @@ class SlackTuiApp(App):
         """Download and render a single image attachment."""
         assert self.slack_client is not None
         msg_view = self.query_one("#message-view", MessageView)
-        data = await self.slack_client.download_file(file.url_private)
+        data = await self.slack_client.download_file(file.url_private, file.id)
         if data:
             msg_view.render_image_attachment(file, data)
+
+    def _bump_channel_activity(self, channel_id: str) -> None:
+        """Update a channel's last_activity and move it to the top of its sidebar category."""
+        now = time.time()
+        for ch in self._all_channels:
+            if ch.id == channel_id:
+                ch.last_activity = now
+                break
+        sidebar = self.query_one("#sidebar", Sidebar)
+        sidebar.move_to_top(channel_id)
 
     def on_new_slack_message(self, event: NewSlackMessage) -> None:
         channel_id = event.message.channel_id
@@ -394,6 +414,10 @@ class SlackTuiApp(App):
         if event.message.text in self._sent_texts:
             self._sent_texts.discard(event.message.text)
             return
+
+        # Bump channel to top of its sidebar category
+        self._bump_channel_activity(channel_id)
+
         if self.current_channel and channel_id == self.current_channel.id:
             # Current channel — show message in chat
             msg_view = self.query_one("#message-view", MessageView)

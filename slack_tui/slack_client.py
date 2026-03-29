@@ -82,7 +82,7 @@ class SlackClient:
                     name=f.get("name", "image"),
                     mimetype=mime,
                     size=f.get("size", 0),
-                    url_private=f.get("url_private", ""),
+                    url_private=f.get("url_private_download", f.get("url_private", "")),
                 ))
         return files
 
@@ -102,7 +102,7 @@ class SlackClient:
         )
         messages: list[Message] = []
         for msg in response.get("messages", []):
-            if msg.get("subtype") and msg["subtype"] not in ("bot_message",):
+            if msg.get("subtype") and msg["subtype"] not in ("bot_message", "file_share"):
                 continue
             user_id = msg.get("user", msg.get("bot_id", "unknown"))
             user_name = await self.get_user_name(user_id)
@@ -131,7 +131,7 @@ class SlackClient:
         )
         messages: list[Message] = []
         for msg in response.get("messages", []):
-            if msg.get("subtype") and msg["subtype"] not in ("bot_message",):
+            if msg.get("subtype") and msg["subtype"] not in ("bot_message", "file_share"):
                 continue
             user_id = msg.get("user", msg.get("bot_id", "unknown"))
             user_name = await self.get_user_name(user_id)
@@ -211,16 +211,52 @@ class SlackClient:
             pass
         return 0.0
 
-    async def download_file(self, url: str) -> bytes | None:
-        """Download a file from Slack using auth headers."""
+    async def download_file(self, url: str, file_id: str | None = None) -> bytes | None:
+        """Download a file from Slack.
+
+        Tries two methods:
+        1. Direct URL download with Bearer token auth
+        2. files.info API to get a fresh URL (requires files:read scope)
+        """
         import aiohttp
-        headers = {"Authorization": f"Bearer {self.web_client.token}"}
+        if not url:
+            return None
+
+        token = self.web_client.token
+        headers = {"Authorization": f"Bearer {token}"}
+
         try:
+            # Direct download with auth header (no auto-redirect — check first)
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers) as resp:
+                async with session.get(url, headers=headers, allow_redirects=False) as resp:
                     if resp.status == 200:
-                        return await resp.read()
-                    log.error("Download failed: %s %s", resp.status, url)
+                        ct = resp.headers.get("Content-Type", "")
+                        if "image" in ct:
+                            data = await resp.read()
+                            log.info("Downloaded %d bytes from direct URL", len(data))
+                            return data
+
+                # Direct URL didn't work — try files.info API for a fresh URL
+                if file_id:
+                    try:
+                        info = await _rate_limit_retry(
+                            lambda: self.web_client.files_info(file=file_id)
+                        )
+                        dl_url = info["file"].get("url_private_download", "")
+                        if dl_url:
+                            async with session.get(dl_url, headers=headers) as resp2:
+                                ct = resp2.headers.get("Content-Type", "")
+                                if resp2.status == 200 and "image" in ct:
+                                    data = await resp2.read()
+                                    log.info("Downloaded %d bytes via files.info", len(data))
+                                    return data
+                    except SlackApiError as e:
+                        if "missing_scope" in str(e):
+                            log.warning("files:read scope needed for image downloads")
+                        else:
+                            log.error("files.info failed: %s", e)
+
+            log.warning("Could not download file: %s (add files:read scope to your Slack app)", url[:80])
         except Exception as e:
             log.error("Download error: %s", e)
         return None

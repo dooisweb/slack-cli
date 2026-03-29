@@ -8,7 +8,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 log = logging.getLogger(__name__)
 
-from slack_tui.models import Channel, ChannelType, FileAttachment, Message, User
+from slack_tui.models import Channel, ChannelType, FileAttachment, Message, SearchResult, User
 from slack_tui import cache as disk_cache
 
 
@@ -116,6 +116,8 @@ class SlackClient:
                     text=msg.get("text", ""),
                     timestamp=float(ts.split(".")[0]),
                     files=self._parse_image_files(msg),
+                    thread_ts=msg.get("thread_ts") if msg.get("thread_ts") != ts else None,
+                    reply_count=msg.get("reply_count", 0),
                 )
             )
 
@@ -145,6 +147,8 @@ class SlackClient:
                     text=msg.get("text", ""),
                     timestamp=float(ts.split(".")[0]),
                     files=self._parse_image_files(msg),
+                    thread_ts=msg.get("thread_ts") if msg.get("thread_ts") != ts else None,
+                    reply_count=msg.get("reply_count", 0),
                 )
             )
         messages.reverse()
@@ -158,6 +162,49 @@ class SlackClient:
         except SlackApiError as e:
             error = e.response["error"]
             logging.getLogger(__name__).error("send_message failed: %s", error)
+            return False, error
+
+    async def fetch_thread(self, channel_id: str, thread_ts: str) -> list[Message]:
+        """Fetch all replies in a thread, oldest first."""
+        response = await _rate_limit_retry(
+            lambda: self.web_client.conversations_replies(
+                channel=channel_id, ts=thread_ts, limit=200
+            )
+        )
+        messages: list[Message] = []
+        for msg in response.get("messages", []):
+            if msg.get("subtype") and msg["subtype"] not in ("bot_message", "file_share"):
+                continue
+            user_id = msg.get("user", msg.get("bot_id", "unknown"))
+            user_name = await self.get_user_name(user_id)
+            ts = msg["ts"]
+            messages.append(
+                Message(
+                    ts=ts,
+                    channel_id=channel_id,
+                    user_id=user_id,
+                    user_name=user_name,
+                    text=msg.get("text", ""),
+                    timestamp=float(ts.split(".")[0]),
+                    files=self._parse_image_files(msg),
+                    thread_ts=msg.get("thread_ts") if msg.get("thread_ts") != ts else None,
+                    reply_count=msg.get("reply_count", 0),
+                )
+            )
+        return messages
+
+    async def send_thread_reply(
+        self, channel_id: str, thread_ts: str, text: str
+    ) -> tuple[bool, str]:
+        """Send a threaded reply. Returns (success, error_message)."""
+        try:
+            await self.web_client.chat_postMessage(
+                channel=channel_id, text=text, thread_ts=thread_ts
+            )
+            return True, ""
+        except SlackApiError as e:
+            error = e.response["error"]
+            log.error("send_thread_reply failed: %s", error)
             return False, error
 
     async def get_user_name(self, user_id: str) -> str:
@@ -281,3 +328,31 @@ class SlackClient:
             return ", ".join(names) if names else channel.name
         except SlackApiError:
             return channel.name
+
+    async def search_messages(self, query: str, count: int = 20) -> list[SearchResult]:
+        """Search messages across the workspace.
+
+        Requires the ``search:read`` OAuth scope on the user token.
+        Returns a list of :class:`SearchResult` objects.
+        """
+        response = await _rate_limit_retry(
+            lambda: self.web_client.search_messages(query=query, count=count, sort="timestamp")
+        )
+        results: list[SearchResult] = []
+        for match in response.get("messages", {}).get("matches", []):
+            channel_info = match.get("channel", {})
+            channel_id = channel_info.get("id", "")
+            channel_name = channel_info.get("name", "unknown")
+            user_name = match.get("username", "unknown")
+            text = match.get("text", "")
+            ts = match.get("ts", "0")
+            permalink = match.get("permalink", "")
+            results.append(SearchResult(
+                channel_id=channel_id,
+                channel_name=channel_name,
+                user_name=user_name,
+                text=text,
+                timestamp=float(ts.split(".")[0]) if ts else 0.0,
+                permalink=permalink,
+            ))
+        return results

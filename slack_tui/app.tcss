@@ -12,6 +12,21 @@ Screen {
 
 #sidebar > .listview--item {
     padding: 0 1;
+    height: auto;
+}
+
+.channel-item-container {
+    height: auto;
+}
+
+.channel-name {
+    height: 1;
+}
+
+.channel-preview {
+    height: 1;
+    color: $text-muted;
+    text-style: italic;
 }
 
 CategoryHeader {
@@ -32,7 +47,7 @@ ChatPanel {
 
 #message-view {
     height: 1fr;
-    padding: 0 1;
+    padding: 1 2;
 }
 
 #message-input {
@@ -78,4 +93,10 @@ AuthScreen {
 
 #auth-buttons Button {
     margin: 0 2;
+}
+
+/* Thread view — slightly different background to indicate nested context */
+#message-view.thread-view {
+    background: $surface-darken-1;
+    padding: 1 3;
 }

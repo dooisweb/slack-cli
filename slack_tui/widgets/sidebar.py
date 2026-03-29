@@ -2,6 +2,7 @@
 
 from textual.message import Message as TextualMessage
 from textual.widgets import Label, ListItem, ListView
+from textual.containers import Vertical
 
 from slack_tui.models import Channel, ChannelType
 
@@ -36,26 +37,45 @@ class CategoryHeader(ListItem):
 class ChannelListItem(ListItem):
     """A single channel/DM entry."""
 
+    MAX_PREVIEW_LEN = 25
+
     def __init__(self, channel: Channel, category_key: str) -> None:
         self.channel = channel
         self.category_key = category_key
         self._has_unread = False
+        self._preview_text = ""
         prefix = _TYPE_PREFIX.get(channel.channel_type, "")
         self._base_label = f"{prefix} {channel.name}" if prefix else channel.name
-        super().__init__(Label(f"  {self._base_label}"), id=f"channel-{channel.id}")
+        self._name_label = Label(f"  {self._base_label}", classes="channel-name")
+        self._preview_label = Label("", classes="channel-preview")
+        self._preview_label.display = False
+        super().__init__(
+            Vertical(self._name_label, self._preview_label, classes="channel-item-container"),
+            id=f"channel-{channel.id}",
+        )
 
     def set_unread(self, unread: bool) -> None:
         """Toggle the unread indicator (bold + dot)."""
         if unread == self._has_unread:
             return
         self._has_unread = unread
-        lbl = self.query_one(Label)
         if unread:
-            lbl.update(f"  ● {self._base_label}")
-            lbl.styles.text_style = "bold"
+            self._name_label.update(f"  \u25cf {self._base_label}")
+            self._name_label.styles.text_style = "bold"
         else:
-            lbl.update(f"  {self._base_label}")
-            lbl.styles.text_style = "none"
+            self._name_label.update(f"  {self._base_label}")
+            self._name_label.styles.text_style = "none"
+
+    def set_preview(self, user_name: str, text: str) -> None:
+        """Update the message preview line below the channel name."""
+        # Flatten to single line
+        flat = text.replace("\n", " ").strip()
+        preview = f"{user_name}: {flat}"
+        if len(preview) > self.MAX_PREVIEW_LEN:
+            preview = preview[: self.MAX_PREVIEW_LEN] + "\u2026"
+        self._preview_text = preview
+        self._preview_label.update(f"    {preview}")
+        self._preview_label.display = True
 
 
 class Sidebar(ListView):
@@ -117,6 +137,13 @@ class Sidebar(ListView):
             self._toggle_category_items(event.item.category_key, event.item.expanded)
         elif isinstance(event.item, ChannelListItem):
             self.post_message(self.ChannelSelected(event.item.channel))
+
+    def update_preview(self, channel_id: str, user_name: str, text: str) -> None:
+        """Update the message preview for a channel."""
+        for child in self.children:
+            if isinstance(child, ChannelListItem) and child.channel.id == channel_id:
+                child.set_preview(user_name, text)
+                break
 
     def mark_unread(self, channel_id: str, unread: bool = True) -> None:
         """Set or clear the unread indicator for a channel."""

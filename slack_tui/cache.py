@@ -120,6 +120,8 @@ def save_history(channel_id: str, messages: list[Message]) -> None:
                 }
                 for f in m.files
             ],
+            "thread_ts": m.thread_ts,
+            "reply_count": m.reply_count,
         }
         for m in messages
     ]
@@ -150,6 +152,8 @@ def load_history(channel_id: str) -> list[Message] | None:
                     )
                     for f in item.get("files", [])
                 ],
+                thread_ts=item.get("thread_ts"),
+                reply_count=item.get("reply_count", 0),
             )
             for item in data
         ]

@@ -39,6 +39,16 @@ class FileAttachment:
 
 
 @dataclass
+class SearchResult:
+    channel_id: str
+    channel_name: str
+    user_name: str
+    text: str
+    timestamp: float
+    permalink: str
+
+
+@dataclass
 class Message:
     ts: str  # Slack timestamp (unique message ID)
     channel_id: str
@@ -47,3 +57,5 @@ class Message:
     text: str
     timestamp: float  # Unix timestamp for display formatting
     files: list[FileAttachment] = field(default_factory=list)
+    thread_ts: str | None = None  # Parent message ts — if set, this is a thread reply
+    reply_count: int = 0  # Number of thread replies

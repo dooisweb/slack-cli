@@ -25,6 +25,9 @@ from slack_tui.widgets.sidebar import ChannelListItem, Sidebar
 # Available slash commands: (name, description)
 COMMANDS = [
     ("/msg", "jump to a DM or channel"),
+    ("/search", "search messages"),
+    ("/back", "return to channel view"),
+    ("/thread", "view thread for last message with replies"),
     ("/channels", "reload channel list"),
     ("/help", "show available commands"),
 ]
@@ -49,6 +52,7 @@ class SlackTuiApp(App):
     CSS_PATH = "app.tcss"
     BINDINGS = [
         ("tab", "toggle_focus", "Switch Panel"),
+        ("escape", "exit_thread", "Back"),
         ("ctrl+q", "quit", "Quit"),
     ]
 
@@ -62,6 +66,10 @@ class SlackTuiApp(App):
         self._all_channels: list[Channel] = []
         self._channel_last_ts: dict[str, str] = {}  # track last seen ts per channel
         self._sent_texts: set[str] = set()  # track recently sent texts to deduplicate
+        self._pre_search_channel: Channel | None = None  # channel before search, for /back
+        self._current_thread_ts: str | None = None  # set when viewing a thread
+        self._thread_last_ts: str | None = None  # for polling thread replies
+        self._thread_messages: list[Message] = []  # cached thread messages
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -142,6 +150,7 @@ class SlackTuiApp(App):
             self.notify(f"Failed to load channels: {e}", severity="error")
 
     def on_sidebar_channel_selected(self, event: Sidebar.ChannelSelected) -> None:
+        self._exit_thread_view()
         self.current_channel = event.channel
         self.sub_title = event.channel.name
         self._last_message_ts = None
@@ -187,20 +196,43 @@ class SlackTuiApp(App):
         )
 
     async def _poll_current_channel(self) -> None:
-        """Poll the active channel every POLL_INTERVAL seconds."""
+        """Poll the active channel (or active thread) every POLL_INTERVAL seconds."""
         while True:
             if self.current_channel:
-                last_ts = self._channel_last_ts.get(self.current_channel.id)
-                if last_ts:
+                # Poll thread if we're in thread view
+                if self._current_thread_ts and self._thread_last_ts:
                     try:
-                        new_msgs = await self.slack_client.fetch_new_messages(
-                            self.current_channel.id, last_ts
+                        thread_msgs = await self.slack_client.fetch_thread(
+                            self.current_channel.id, self._current_thread_ts
                         )
-                        for msg in new_msgs:
-                            self._channel_last_ts[self.current_channel.id] = msg.ts
-                            self.post_message(NewSlackMessage(msg))
+                        # Find messages newer than what we've shown
+                        new_thread_msgs = [
+                            m for m in thread_msgs
+                            if m.ts > self._thread_last_ts
+                        ]
+                        if new_thread_msgs:
+                            msg_view = self.query_one("#message-view", MessageView)
+                            for msg in new_thread_msgs:
+                                if msg.text not in self._sent_texts:
+                                    msg_view.append_message(msg)
+                                else:
+                                    self._sent_texts.discard(msg.text)
+                            self._thread_last_ts = new_thread_msgs[-1].ts
                     except Exception:
                         pass
+                else:
+                    # Poll the channel normally
+                    last_ts = self._channel_last_ts.get(self.current_channel.id)
+                    if last_ts:
+                        try:
+                            new_msgs = await self.slack_client.fetch_new_messages(
+                                self.current_channel.id, last_ts
+                            )
+                            for msg in new_msgs:
+                                self._channel_last_ts[self.current_channel.id] = msg.ts
+                                self.post_message(NewSlackMessage(msg))
+                        except Exception:
+                            pass
             await asyncio.sleep(POLL_INTERVAL)
 
     async def _poll_background_channels(self) -> None:
@@ -304,12 +336,22 @@ class SlackTuiApp(App):
                 user_name="You",
                 text=text,
                 timestamp=now,
+                thread_ts=self._current_thread_ts,
             )
             msg_view = self.query_one("#message-view", MessageView)
             msg_view.append_message(local_msg)
             self._sent_texts.add(text)
             self._bump_channel_activity(self.current_channel.id)
-            self._send_message(self.current_channel.id, text)
+            if self._current_thread_ts:
+                # Send as thread reply
+                self._send_thread_reply(
+                    self.current_channel.id, self._current_thread_ts, text
+                )
+            else:
+                # Update sidebar preview
+                sidebar = self.query_one("#sidebar", Sidebar)
+                sidebar.update_preview(self.current_channel.id, "You", text)
+                self._send_message(self.current_channel.id, text)
 
     def _handle_command(self, text: str) -> None:
         """Parse and execute slash commands from the message input."""
@@ -319,6 +361,12 @@ class SlackTuiApp(App):
 
         if cmd == "/msg":
             self._cmd_msg(arg)
+        elif cmd == "/search":
+            self._cmd_search(arg)
+        elif cmd == "/back":
+            self._cmd_back()
+        elif cmd == "/thread":
+            self._cmd_thread()
         elif cmd == "/channels":
             self._cmd_channels()
         elif cmd == "/help":
@@ -344,11 +392,64 @@ class SlackTuiApp(App):
         self._refresh_channels()
         self.notify("Reloading channels...", timeout=3)
 
+    def _cmd_search(self, query: str) -> None:
+        """Search messages across the workspace. Usage: /search <query>"""
+        if not query:
+            self.notify("Usage: /search <query>", severity="warning", timeout=5)
+            return
+        self._pre_search_channel = self.current_channel
+        self.current_channel = None
+        self.sub_title = f"Search: {query}"
+        self.notify("Searching...", timeout=3)
+        self._run_search(query)
+
+    @work(exclusive=True, group="search")
+    async def _run_search(self, query: str) -> None:
+        """Execute the search API call and display results."""
+        assert self.slack_client is not None
+        msg_view = self.query_one("#message-view", MessageView)
+        try:
+            results = await self.slack_client.search_messages(query)
+            msg_view.show_search_results(query, results)
+        except Exception as e:
+            error_str = str(e)
+            if "missing_scope" in error_str or "not_allowed_token_type" in error_str:
+                self.notify(
+                    "Search requires the search:read scope. "
+                    "Add it to your Slack app's User Token Scopes at "
+                    "api.slack.com/apps, then re-authenticate.",
+                    severity="error",
+                    timeout=15,
+                )
+            else:
+                self.notify(f"Search failed: {e}", severity="error", timeout=10)
+
+    def _cmd_back(self) -> None:
+        """Return to the channel view before the last search."""
+        if self._pre_search_channel is not None:
+            self._select_channel(self._pre_search_channel)
+            self._pre_search_channel = None
+        else:
+            self.notify("Nothing to go back to.", severity="warning", timeout=5)
+
+    def on_message_view_search_navigate_request(self, event: MessageView.SearchNavigateRequest) -> None:
+        """Handle clicking a channel name in search results."""
+        channel_id = event.channel_id
+        for ch in self._all_channels:
+            if ch.id == channel_id:
+                self._pre_search_channel = None  # clear search state on navigation
+                self._select_channel(ch)
+                return
+        self.notify(f"Channel not found in your channel list.", severity="warning", timeout=5)
+
     def _cmd_help(self) -> None:
         """Show available commands."""
         help_text = (
             "/msg @user — jump to a DM\n"
             "/msg #channel — jump to a channel\n"
+            "/search <query> — search messages\n"
+            "/back — return to channel after search\n"
+            "/thread — view thread of last message with replies\n"
             "/channels — reload channel list\n"
             "/help — show this help"
         )
@@ -356,6 +457,7 @@ class SlackTuiApp(App):
 
     def _select_channel(self, channel: Channel) -> None:
         """Programmatically select a channel (same as clicking sidebar)."""
+        self._exit_thread_view()
         self.current_channel = channel
         self.sub_title = channel.name
         self._last_message_ts = None
@@ -375,6 +477,104 @@ class SlackTuiApp(App):
         success, error = await self.slack_client.send_message(channel_id, text)
         if not success:
             self.notify(f"Send failed: {error}", severity="error", timeout=5)
+
+    @work(exclusive=False, group="send")
+    async def _send_thread_reply(
+        self, channel_id: str, thread_ts: str, text: str
+    ) -> None:
+        assert self.slack_client is not None
+        success, error = await self.slack_client.send_thread_reply(
+            channel_id, thread_ts, text
+        )
+        if not success:
+            self.notify(f"Thread reply failed: {error}", severity="error", timeout=5)
+
+    # --- Thread view ---
+
+    def _cmd_thread(self) -> None:
+        """Open thread view for the most recent message with replies in current channel."""
+        if not self.current_channel:
+            self.notify("No channel selected.", severity="warning", timeout=5)
+            return
+        # Find the last message with replies from the cached history
+        cached = disk_cache.load_history(self.current_channel.id)
+        if not cached:
+            self.notify("No messages loaded yet.", severity="warning", timeout=5)
+            return
+        for msg in reversed(cached):
+            if msg.reply_count > 0:
+                self._open_thread(msg.ts, msg.text)
+                return
+        self.notify("No threads found in recent messages.", severity="warning", timeout=5)
+
+    def _open_thread(self, thread_ts: str, parent_text: str) -> None:
+        """Switch to thread view for the given thread_ts."""
+        if not self.current_channel:
+            return
+        self._current_thread_ts = thread_ts
+        self._thread_last_ts = None
+        self._thread_messages = []
+        msg_view = self.query_one("#message-view", MessageView)
+        msg_view.add_class("thread-view")
+        msg_view.show_thread_header(parent_text)
+        self.sub_title = f"Thread in {self.current_channel.name}"
+        msg_input = self.query_one("#message-input", MessageInput)
+        msg_input.placeholder = "Reply in thread... (Escape to go back)"
+        self._load_thread(self.current_channel.id, thread_ts)
+
+    @work(exclusive=True, group="thread")
+    async def _load_thread(self, channel_id: str, thread_ts: str) -> None:
+        """Fetch and display thread messages."""
+        assert self.slack_client is not None
+        try:
+            messages = await self.slack_client.fetch_thread(channel_id, thread_ts)
+            self._thread_messages = messages
+            msg_view = self.query_one("#message-view", MessageView)
+            # Re-show thread header then append all messages
+            if messages:
+                msg_view.show_thread_header(messages[0].text)
+                for msg in messages:
+                    msg_view.append_message(msg)
+                self._thread_last_ts = messages[-1].ts
+                self._download_images(messages)
+        except Exception as e:
+            self.notify(f"Failed to load thread: {e}", severity="error")
+
+    def _exit_thread_view(self) -> None:
+        """Leave thread view and return to channel messages."""
+        if not self._current_thread_ts:
+            return
+        self._current_thread_ts = None
+        self._thread_last_ts = None
+        self._thread_messages = []
+        msg_view = self.query_one("#message-view", MessageView)
+        msg_view.remove_class("thread-view")
+        msg_input = self.query_one("#message-input", MessageInput)
+        msg_input.placeholder = "Type a message... (/ for commands)"
+        if self.current_channel:
+            self.sub_title = self.current_channel.name
+            self._load_history()
+
+    def on_message_view_thread_view_request(
+        self, event: MessageView.ThreadViewRequest
+    ) -> None:
+        """Handle clicking [View Thread] on a message."""
+        if not self.current_channel:
+            return
+        # Find the parent message text from cache
+        cached = disk_cache.load_history(self.current_channel.id)
+        parent_text = ""
+        if cached:
+            for msg in cached:
+                if msg.ts == event.thread_ts:
+                    parent_text = msg.text
+                    break
+        self._open_thread(event.thread_ts, parent_text)
+
+    def action_exit_thread(self) -> None:
+        """Escape key handler — exit thread view if active."""
+        if self._current_thread_ts:
+            self._exit_thread_view()
 
     @work(exclusive=False, group="images")
     async def _download_images(self, messages: list[Message]) -> None:
@@ -417,6 +617,10 @@ class SlackTuiApp(App):
 
         # Bump channel to top of its sidebar category
         self._bump_channel_activity(channel_id)
+
+        # Update sidebar preview for this channel
+        sidebar = self.query_one("#sidebar", Sidebar)
+        sidebar.update_preview(channel_id, event.message.user_name, event.message.text)
 
         if self.current_channel and channel_id == self.current_channel.id:
             # Current channel — show message in chat

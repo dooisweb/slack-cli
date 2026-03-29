@@ -8,6 +8,7 @@ dependencies = [
     "slack_sdk>=3.27.0",
     "aiohttp>=3.9.0",
     "Pillow>=10.0.0",
+    "emoji>=2.0.0",
 ]
 
 [project.scripts]

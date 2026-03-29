@@ -6,10 +6,20 @@ import logging
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
+from slack_tui import cache as disk_cache
+from slack_tui.models import Channel, ChannelType, FileAttachment, Message, SearchResult, User
+
 log = logging.getLogger(__name__)
 
-from slack_tui.models import Channel, ChannelType, FileAttachment, Message, SearchResult, User
-from slack_tui import cache as disk_cache
+
+def _safe_ts(ts: str) -> float:
+    """Parse a Slack timestamp string to a float, returning 0.0 on failure."""
+    if not ts:
+        return 0.0
+    try:
+        return float(ts.split(".")[0])
+    except (ValueError, IndexError):
+        return 0.0
 
 
 async def _rate_limit_retry(coro_fn, max_retries: int = 2):
@@ -114,7 +124,7 @@ class SlackClient:
                     user_id=user_id,
                     user_name=user_name,
                     text=msg.get("text", ""),
-                    timestamp=float(ts.split(".")[0]),
+                    timestamp=_safe_ts(ts),
                     files=self._parse_image_files(msg),
                     thread_ts=msg.get("thread_ts") if msg.get("thread_ts") != ts else None,
                     reply_count=msg.get("reply_count", 0),
@@ -145,7 +155,7 @@ class SlackClient:
                     user_id=user_id,
                     user_name=user_name,
                     text=msg.get("text", ""),
-                    timestamp=float(ts.split(".")[0]),
+                    timestamp=_safe_ts(ts),
                     files=self._parse_image_files(msg),
                     thread_ts=msg.get("thread_ts") if msg.get("thread_ts") != ts else None,
                     reply_count=msg.get("reply_count", 0),
@@ -161,7 +171,7 @@ class SlackClient:
             return True, ""
         except SlackApiError as e:
             error = e.response["error"]
-            logging.getLogger(__name__).error("send_message failed: %s", error)
+            log.error("send_message failed: %s", error)
             return False, error
 
     async def fetch_thread(self, channel_id: str, thread_ts: str) -> list[Message]:
@@ -185,7 +195,7 @@ class SlackClient:
                     user_id=user_id,
                     user_name=user_name,
                     text=msg.get("text", ""),
-                    timestamp=float(ts.split(".")[0]),
+                    timestamp=_safe_ts(ts),
                     files=self._parse_image_files(msg),
                     thread_ts=msg.get("thread_ts") if msg.get("thread_ts") != ts else None,
                     reply_count=msg.get("reply_count", 0),
@@ -241,8 +251,13 @@ class SlackClient:
         disk_cache.save_users(self._user_cache)
 
     async def get_own_user_id(self) -> str:
-        """Get the authenticated user's own ID via auth.test."""
-        response = await self.web_client.auth_test()
+        """Get the authenticated user's own ID via auth.test.
+
+        Raises SlackApiError if the token is invalid or revoked.
+        """
+        response = await _rate_limit_retry(
+            lambda: self.web_client.auth_test()
+        )
         return response["user_id"]
 
     async def fetch_last_message_ts(self, channel_id: str) -> float:
@@ -255,8 +270,8 @@ class SlackClient:
             )
             messages = response.get("messages", [])
             if messages:
-                return float(messages[0]["ts"])
-        except SlackApiError:
+                return float(messages[0].get("ts", "0"))
+        except (SlackApiError, ValueError, KeyError):
             pass
         return 0.0
 
@@ -284,6 +299,21 @@ class SlackClient:
                 await asyncio.sleep(delay)
         return results
 
+    # Maximum image download size (50 MB) to prevent memory exhaustion
+    _MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+    async def _read_bounded(self, resp) -> bytes | None:
+        """Read response body up to _MAX_DOWNLOAD_BYTES; return None if exceeded."""
+        content_length = resp.headers.get("Content-Length")
+        if content_length and int(content_length) > self._MAX_DOWNLOAD_BYTES:
+            log.warning("File too large (%s bytes), skipping download", content_length)
+            return None
+        data = await resp.content.read(self._MAX_DOWNLOAD_BYTES + 1)
+        if len(data) > self._MAX_DOWNLOAD_BYTES:
+            log.warning("Download exceeded %d byte limit, discarding", self._MAX_DOWNLOAD_BYTES)
+            return None
+        return data
+
     async def download_file(self, url: str, file_id: str | None = None) -> bytes | None:
         """Download a file from Slack.
 
@@ -293,6 +323,11 @@ class SlackClient:
         """
         import aiohttp
         if not url:
+            return None
+
+        # Only allow HTTPS URLs to prevent token leakage over plain HTTP
+        if not url.startswith("https://"):
+            log.warning("Refusing to download from non-HTTPS URL: %s", url[:80])
             return None
 
         token = self.web_client.token
@@ -305,8 +340,9 @@ class SlackClient:
                     if resp.status == 200:
                         ct = resp.headers.get("Content-Type", "")
                         if "image" in ct:
-                            data = await resp.read()
-                            log.info("Downloaded %d bytes from direct URL", len(data))
+                            data = await self._read_bounded(resp)
+                            if data:
+                                log.info("Downloaded %d bytes from direct URL", len(data))
                             return data
 
                 # Direct URL didn't work — try files.info API for a fresh URL
@@ -316,12 +352,13 @@ class SlackClient:
                             lambda: self.web_client.files_info(file=file_id)
                         )
                         dl_url = info["file"].get("url_private_download", "")
-                        if dl_url:
+                        if dl_url and dl_url.startswith("https://"):
                             async with session.get(dl_url, headers=headers) as resp2:
                                 ct = resp2.headers.get("Content-Type", "")
                                 if resp2.status == 200 and "image" in ct:
-                                    data = await resp2.read()
-                                    log.info("Downloaded %d bytes via files.info", len(data))
+                                    data = await self._read_bounded(resp2)
+                                    if data:
+                                        log.info("Downloaded %d bytes via files.info", len(data))
                                     return data
                     except SlackApiError as e:
                         if "missing_scope" in str(e):
@@ -355,6 +392,104 @@ class SlackClient:
         except SlackApiError:
             return channel.name
 
+    async def fetch_user_presence_batch(
+        self, user_ids: list[str], batch_size: int = 5, delay: float = 1.0
+    ) -> dict[str, str]:
+        """Fetch presence for multiple users in batches.
+
+        Returns a mapping of user_id -> presence ("active" or "away").
+        Users that fail to fetch default to "away".
+        """
+        results: dict[str, str] = {}
+        for i in range(0, len(user_ids), batch_size):
+            batch = user_ids[i : i + batch_size]
+            tasks = [self._fetch_single_presence(uid) for uid in batch]
+            presences = await asyncio.gather(*tasks, return_exceptions=True)
+            for uid, presence in zip(batch, presences):
+                if isinstance(presence, Exception):
+                    log.debug("Failed to fetch presence for %s: %s", uid, presence)
+                    results[uid] = "away"
+                else:
+                    results[uid] = presence
+            # Rate-limit delay between batches (skip after the last batch)
+            if i + batch_size < len(user_ids):
+                await asyncio.sleep(delay)
+        return results
+
+    async def _fetch_single_presence(self, user_id: str) -> str:
+        """Fetch presence for a single user. Returns 'active' or 'away'."""
+        response = await _rate_limit_retry(
+            lambda uid=user_id: self.web_client.users_getPresence(user=uid)
+        )
+        return response.get("presence", "away")
+
+    async def upload_file(
+        self,
+        channel_id: str,
+        file_path: str,
+        initial_comment: str = "",
+        thread_ts: str | None = None,
+    ) -> tuple[bool, str]:
+        """Upload a file using the modern two-step Slack upload flow.
+
+        Returns (success, error_message).
+        """
+        import os
+        import aiohttp
+
+        filename = os.path.basename(file_path)
+
+        try:
+            file_size = os.path.getsize(file_path)
+            # Step 1: Get an upload URL from Slack
+            response = await _rate_limit_retry(
+                lambda: self.web_client.api_call(
+                    "files.getUploadURLExternal",
+                    params={"filename": filename, "length": file_size},
+                )
+            )
+            upload_url = response["upload_url"]
+            file_id = response["file_id"]
+
+            # Step 2: POST the raw file bytes to the upload URL
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(upload_url, data=file_data) as resp:
+                    if resp.status not in (200, 201):
+                        body = await resp.text()
+                        return False, f"Upload POST failed ({resp.status}): {body[:200]}"
+
+            # Step 3: Complete the upload, sharing into the channel
+            files_arg = [{"id": file_id, "title": filename}]
+            complete_kwargs: dict = {
+                "files": files_arg,
+                "channel_id": channel_id,
+            }
+            if initial_comment:
+                complete_kwargs["initial_comment"] = initial_comment
+            if thread_ts:
+                complete_kwargs["thread_ts"] = thread_ts
+
+            await _rate_limit_retry(
+                lambda kw=dict(complete_kwargs): self.web_client.api_call(
+                    "files.completeUploadExternal",
+                    json=kw,
+                )
+            )
+            return True, ""
+
+        except SlackApiError as e:
+            error = e.response.get("error", str(e))
+            log.error("upload_file failed: %s", error)
+            return False, error
+        except PermissionError:
+            return False, "Permission denied reading file"
+        except Exception as e:
+            log.error("upload_file unexpected error: %s", e)
+            return False, str(e)
+
     async def search_messages(self, query: str, count: int = 20) -> list[SearchResult]:
         """Search messages across the workspace.
 
@@ -378,7 +513,7 @@ class SlackClient:
                 channel_name=channel_name,
                 user_name=user_name,
                 text=text,
-                timestamp=float(ts.split(".")[0]) if ts else 0.0,
+                timestamp=_safe_ts(ts),
                 permalink=permalink,
             ))
         return results

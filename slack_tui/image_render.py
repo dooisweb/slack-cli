@@ -7,6 +7,9 @@ from rich.color import Color
 from rich.style import Style
 from rich.text import Text
 
+# Limit Pillow decompression to prevent decompression bombs
+Image.MAX_IMAGE_PIXELS = 4_000_000  # ~2000x2000, safe for terminal rendering
+
 # Half-block character: top pixel = foreground, bottom pixel = background
 HALF_BLOCK = "\u2580"  # Upper half block
 
@@ -19,12 +22,18 @@ def render_image(data: bytes, max_width: int = MAX_WIDTH) -> Text:
     Each character cell represents 2 vertical pixels using the upper half
     block character with foreground (top pixel) and background (bottom pixel)
     colors. This gives 2x vertical resolution.
+
+    Raises ValueError if the image data is empty or too small to render.
     """
+    if not data:
+        raise ValueError("Empty image data")
     img = Image.open(BytesIO(data))
     img = img.convert("RGB")
 
     # Resize to fit max_width, maintaining aspect ratio
     w, h = img.size
+    if w == 0 or h == 0:
+        raise ValueError("Image has zero dimensions")
     if w > max_width:
         ratio = max_width / w
         w = max_width

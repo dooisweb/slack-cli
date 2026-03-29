@@ -44,21 +44,29 @@ class SocketListener:
         await client.send_socket_mode_response(response)
 
         log = logging.getLogger(__name__)
-        log.info("Socket event received: type=%s, payload_keys=%s", req.type, list(req.payload.keys()) if req.payload else [])
+        log.debug("Socket event received: type=%s, payload_keys=%s", req.type, list(req.payload.keys()) if req.payload else [])
 
         if req.type == "events_api":
             event = req.payload.get("event", {})
-            log.info("Event: type=%s, subtype=%s, channel=%s, user=%s, text=%s",
-                     event.get("type"), event.get("subtype"), event.get("channel"),
-                     event.get("user"), event.get("text", "")[:50])
+            log.debug("Event: type=%s, subtype=%s, channel=%s, user=%s",
+                      event.get("type"), event.get("subtype"), event.get("channel"),
+                      event.get("user"))
             if event.get("type") == "message" and "subtype" not in event:
-                ts = event["ts"]
+                ts = event.get("ts")
+                channel_id = event.get("channel")
+                if not ts or not channel_id:
+                    log.warning("Malformed message event: missing ts or channel")
+                    return
+                try:
+                    timestamp = float(ts.split(".")[0])
+                except (ValueError, IndexError):
+                    timestamp = 0.0
                 message = Message(
                     ts=ts,
-                    channel_id=event["channel"],
+                    channel_id=channel_id,
                     user_id=event.get("user", "unknown"),
                     user_name="",  # Resolved by the app layer
                     text=event.get("text", ""),
-                    timestamp=float(ts.split(".")[0]),
+                    timestamp=timestamp,
                 )
                 await self.on_message(message)

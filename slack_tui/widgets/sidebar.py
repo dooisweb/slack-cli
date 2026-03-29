@@ -14,6 +14,10 @@ _TYPE_PREFIX = {
     ChannelType.MPDM: "",
 }
 
+# Presence indicator dots
+_PRESENCE_ACTIVE = "\u25cf"  # ● filled circle (green)
+_PRESENCE_AWAY = "\u25cb"    # ○ hollow circle
+
 
 class CategoryHeader(ListItem):
     """A clickable category header that toggles visibility of its items."""
@@ -44,6 +48,7 @@ class ChannelListItem(ListItem):
         self.category_key = category_key
         self._has_unread = False
         self._preview_text = ""
+        self._presence: str | None = None  # "active", "away", or None (no presence shown)
         prefix = _TYPE_PREFIX.get(channel.channel_type, "")
         self._base_label = f"{prefix} {channel.name}" if prefix else channel.name
         self._name_label = Label(f"  {self._base_label}", classes="channel-name")
@@ -54,17 +59,37 @@ class ChannelListItem(ListItem):
             id=f"channel-{channel.id}",
         )
 
+    def _presence_prefix(self) -> str:
+        """Return the presence dot prefix for this item."""
+        if self._presence == "active":
+            return f"[green]{_PRESENCE_ACTIVE}[/green] "
+        elif self._presence == "away":
+            return f"[dim]{_PRESENCE_AWAY}[/dim] "
+        return ""
+
+    def _refresh_label(self) -> None:
+        """Re-render the name label based on current unread + presence state."""
+        presence = self._presence_prefix()
+        if self._has_unread:
+            self._name_label.update(f"  \u25cf {presence}{self._base_label}")
+            self._name_label.styles.text_style = "bold"
+        else:
+            self._name_label.update(f"  {presence}{self._base_label}")
+            self._name_label.styles.text_style = "none"
+
     def set_unread(self, unread: bool) -> None:
         """Toggle the unread indicator (bold + dot)."""
         if unread == self._has_unread:
             return
         self._has_unread = unread
-        if unread:
-            self._name_label.update(f"  \u25cf {self._base_label}")
-            self._name_label.styles.text_style = "bold"
-        else:
-            self._name_label.update(f"  {self._base_label}")
-            self._name_label.styles.text_style = "none"
+        self._refresh_label()
+
+    def set_presence(self, presence: str) -> None:
+        """Set the presence state ('active', 'away', or None)."""
+        if presence == self._presence:
+            return
+        self._presence = presence
+        self._refresh_label()
 
     def set_preview(self, user_name: str, text: str) -> None:
         """Update the message preview line below the channel name."""
@@ -74,7 +99,9 @@ class ChannelListItem(ListItem):
         if len(preview) > self.MAX_PREVIEW_LEN:
             preview = preview[: self.MAX_PREVIEW_LEN] + "\u2026"
         self._preview_text = preview
-        self._preview_label.update(f"    {preview}")
+        # Escape Rich markup brackets to prevent injection from message content
+        safe_preview = preview.replace("[", "\\[")
+        self._preview_label.update(f"    {safe_preview}")
         self._preview_label.display = True
 
 
@@ -195,6 +222,18 @@ class Sidebar(ListView):
             return
 
         self.move_child(target, before=first_slot)
+
+    def update_presence(self, user_presence: dict[str, str]) -> None:
+        """Update presence indicators for DM channels.
+
+        Args:
+            user_presence: mapping of user_id -> presence ("active" or "away")
+        """
+        for child in self.children:
+            if isinstance(child, ChannelListItem) and child.channel.channel_type == ChannelType.DM:
+                user_id = child.channel.user_id
+                if user_id and user_id in user_presence:
+                    child.set_presence(user_presence[user_id])
 
     def _toggle_category_items(self, category_key: str, visible: bool) -> None:
         """Show or hide all channel items under a category."""

@@ -26,9 +26,21 @@ class AuthScreen(ModalScreen[SlackConfig | None]):
         if event.button.id == "save":
             bot = self.query_one("#bot-token", Input).value.strip()
             app_tok = self.query_one("#app-token", Input).value.strip()
-            if bot and app_tok:
-                self.dismiss(SlackConfig(bot_token=bot, app_token=app_tok))
-            else:
+            if not bot or not app_tok:
                 self.notify("Both tokens are required", severity="error")
+                return
+            if not (bot.startswith("xoxb-") or bot.startswith("xoxp-")):
+                self.notify(
+                    "Bot token must start with xoxb- or xoxp-",
+                    severity="error",
+                )
+                return
+            if not app_tok.startswith("xapp-"):
+                self.notify(
+                    "App token must start with xapp-",
+                    severity="error",
+                )
+                return
+            self.dismiss(SlackConfig(bot_token=bot, app_token=app_tok))
         elif event.button.id == "cancel":
             self.dismiss(None)

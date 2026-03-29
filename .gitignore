@@ -9,5 +9,8 @@ build/
 .venv/
 venv/
 .env
+.env.*
 *.toml.bak
+config.toml
 .claude/
+logs/

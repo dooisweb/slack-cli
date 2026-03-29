@@ -22,7 +22,10 @@ class AutocompleteOption(Static):
 
     def __init__(self, text: str, description: str = "") -> None:
         self.option_text = text
-        display = f"{text}  [dim]{description}[/]" if description else text
+        # Escape Rich markup brackets in user-controlled content
+        safe_text = text.replace("[", "\\[")
+        safe_desc = description.replace("[", "\\[")
+        display = f"{safe_text}  [dim]{safe_desc}[/]" if safe_desc else safe_text
         super().__init__(display)
 
 

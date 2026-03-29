@@ -50,41 +50,76 @@ class MessageInput(Input):
             return None
         return fragment
 
+    def _find_mention_prefix(self, text: str, cursor: int) -> str | None:
+        """Check if cursor is inside a @mention like '@john'."""
+        left = text[:cursor]
+        at_pos = left.rfind("@")
+        if at_pos == -1:
+            return None
+        # @ must be at start of text or preceded by a space
+        if at_pos > 0 and left[at_pos - 1] != " ":
+            return None
+        fragment = left[at_pos:]
+        # Must have at least 1 char after @, no spaces within the fragment
+        if " " in fragment or len(fragment) < 2:
+            return None
+        return fragment
+
     def on_input_changed(self, event: Input.Changed) -> None:
         text = event.value
         if text.startswith("/"):
             self.post_message(self.AutocompleteRequest(text))
         elif self._find_emoji_prefix(text, self.cursor_position):
             self.post_message(self.AutocompleteRequest(text))
+        elif self._find_mention_prefix(text, self.cursor_position):
+            self.post_message(self.AutocompleteRequest(text))
         else:
             self.post_message(self.AutocompleteDismiss())
+
+    def _get_dropdown(self):
+        """Safely get the autocomplete dropdown, or None if not mounted."""
+        from textual.css.query import NoMatches
+        from slack_tui.widgets.autocomplete import AutocompleteDropdown
+        try:
+            return self.screen.query_one("#autocomplete", AutocompleteDropdown)
+        except NoMatches:
+            return None
 
     def on_key(self, event: Key) -> None:
         if self._autocomplete_active:
             if event.key == "up":
                 event.prevent_default()
                 event.stop()
-                from slack_tui.widgets.autocomplete import AutocompleteDropdown
-                dropdown = self.screen.query_one("#autocomplete", AutocompleteDropdown)
-                dropdown.move_up()
+                dropdown = self._get_dropdown()
+                if dropdown:
+                    dropdown.move_up()
                 return
             elif event.key == "down":
                 event.prevent_default()
                 event.stop()
-                from slack_tui.widgets.autocomplete import AutocompleteDropdown
-                dropdown = self.screen.query_one("#autocomplete", AutocompleteDropdown)
-                dropdown.move_down()
+                dropdown = self._get_dropdown()
+                if dropdown:
+                    dropdown.move_down()
                 return
             elif event.key == "tab":
                 event.prevent_default()
                 event.stop()
-                from slack_tui.widgets.autocomplete import AutocompleteDropdown
-                dropdown = self.screen.query_one("#autocomplete", AutocompleteDropdown)
+                dropdown = self._get_dropdown()
+                if not dropdown:
+                    return
                 selected = dropdown.select_current()
                 if selected:
                     # Check if we're completing an emoji (selected is a unicode char)
                     emoji_prefix = self._find_emoji_prefix(self.value, self.cursor_position)
-                    if emoji_prefix and not selected.startswith("/"):
+                    mention_prefix = self._find_mention_prefix(self.value, self.cursor_position)
+                    if mention_prefix and selected.startswith("@"):
+                        # Replace the @partial with @DisplayName
+                        left = self.value[:self.cursor_position]
+                        right = self.value[self.cursor_position:]
+                        at_pos = left.rfind("@")
+                        self.value = left[:at_pos] + selected + " " + right
+                        self.cursor_position = at_pos + len(selected) + 1
+                    elif emoji_prefix and not selected.startswith("/"):
                         # Replace the :shortcode with the emoji character
                         left = self.value[:self.cursor_position]
                         right = self.value[self.cursor_position:]

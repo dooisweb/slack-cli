@@ -2,20 +2,25 @@
 
 import re
 import subprocess
+import time
 import webbrowser
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import datetime
 
 import emoji
 
+from rich.cells import cell_len
+from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from textual.events import Click
 from textual.message import Message as TextualMessage
+from textual.selection import Selection
+from textual.strip import Strip
 from textual.widgets import RichLog
 
 from slack_tui.image_render import human_size, render_image
-from slack_tui.models import FileAttachment, Message, SearchResult
+from slack_tui.models import Message, SearchResult
 
 # Rotating palette for user name colors
 _USER_COLORS = [
@@ -35,6 +40,9 @@ _USER_COLORS = [
 
 # Slack markup: <url> or <url|label>
 _SLACK_LINK_RE = re.compile(r"<(https?://[^|>]+)(?:\|([^>]+))?>")
+# Slack user/channel mentions: <@U123456> or <#C123456|channel-name>
+_SLACK_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
+_SLACK_CHANNEL_RE = re.compile(r"<#([A-Z0-9]+)\|([^>]+)>")
 # Bare URLs not inside < >
 _BARE_URL_RE = re.compile(r"(?<![<|])(https?://\S+)")
 
@@ -124,8 +132,48 @@ def _date_label(dt: datetime) -> str:
         return msg_date.strftime("%b %d, %Y")
 
 
+def _format_relative_time(timestamp: float) -> str:
+    """Return a human-friendly relative time string for a message timestamp."""
+    now = time.time()
+    delta = now - timestamp
+    if delta < 0:
+        delta = 0
+
+    seconds = int(delta)
+    minutes = seconds // 60
+    hours = minutes // 60
+    days = hours // 24
+
+    if minutes < 1:
+        return "just now"
+    elif minutes == 1:
+        return "1 minute ago"
+    elif hours < 1:
+        return f"{minutes} minutes ago"
+    elif hours == 1:
+        return "1 hour ago"
+    elif hours < 24:
+        return f"{hours} hours ago"
+    elif days == 1:
+        return "1 day ago"
+    elif days <= 7:
+        return f"{days} days ago"
+    else:
+        dt = datetime.fromtimestamp(timestamp)
+        # Include year if it differs from the current year
+        if dt.year != datetime.now().year:
+            return dt.strftime("%b %-d, %Y")
+        return dt.strftime("%b %-d")
+
+
 def _format_text_with_links(text: str) -> Text:
     """Parse Slack markup and bare URLs into Rich Text with styled links."""
+    # Pre-pass: replace Slack channel mentions <#C123|name> -> #name
+    text = _SLACK_CHANNEL_RE.sub(r"#\2", text)
+    # Pre-pass: replace Slack user mentions <@U123> -> @U123
+    # (the user ID will display; callers can resolve to names beforehand)
+    text = _SLACK_MENTION_RE.sub(r"@\1", text)
+
     text = _convert_emoji_shortcodes(text)
     result = Text()
     pos = 0
@@ -196,13 +244,103 @@ class MessageView(RichLog):
     # Group messages from same user within this many seconds
     _GROUP_THRESHOLD = 300  # 5 minutes
 
+    # Limit image cache to ~50 MB to prevent unbounded memory growth
+    _IMAGE_CACHE_MAX_BYTES = 50 * 1024 * 1024
+
     def __init__(self, **kwargs) -> None:
         super().__init__(markup=True, wrap=True, auto_scroll=True, **kwargs)
         self._user_color_map: dict[str, str] = {}
         self._last_date_label: str | None = None
         self._image_cache: dict[str, bytes] = {}  # file_id -> image bytes
+        self._image_cache_size: int = 0  # track total bytes
         self._last_user_id: str | None = None
         self._last_timestamp: float = 0.0
+        self._in_thread_view: bool = False
+
+    def cache_image(self, file_id: str, data: bytes) -> None:
+        """Store image data in the bounded cache, evicting old entries if needed."""
+        if file_id in self._image_cache:
+            return  # already cached
+        # Evict oldest entries if adding this would exceed the limit
+        while (self._image_cache_size + len(data) > self._IMAGE_CACHE_MAX_BYTES
+               and self._image_cache):
+            oldest_key = next(iter(self._image_cache))
+            self._image_cache_size -= len(self._image_cache[oldest_key])
+            del self._image_cache[oldest_key]
+        self._image_cache[file_id] = data
+        self._image_cache_size += len(data)
+
+    # -- Text-selection support (RichLog lacks these in Textual 8.x) --------
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """Return text covered by *selection* so copy-to-clipboard works."""
+        text = "\n".join(strip.text for strip in self.lines)
+        return selection.extract(text), "\n"
+
+    def selection_updated(self, selection: Selection | None) -> None:
+        """Called by Textual when the drag-selection changes."""
+        self._line_cache.clear()
+        self.refresh()
+
+    def render_line(self, y: int) -> Strip:
+        """Render a single visual line, adding offset metadata and
+        selection highlighting that the base RichLog omits."""
+        scroll_x, scroll_y = self.scroll_offset
+        line = self._render_line_with_selection(
+            scroll_y + y, scroll_x, self.scrollable_content_region.width
+        )
+        return line.apply_style(self.rich_style)
+
+    def _render_line_with_selection(
+        self, y: int, scroll_x: int, width: int
+    ) -> Strip:
+        """Produce a Strip for absolute line *y* with selection highlight."""
+        if y >= len(self.lines):
+            return Strip.blank(width, self.rich_style)
+
+        selection = self.text_selection
+
+        # If there's no active selection we can use the parent's cache.
+        if selection is None:
+            key = (y + self._start_line, scroll_x, width, self._widest_line_width)
+            if key in self._line_cache:
+                return self._line_cache[key]
+
+        raw_strip = self.lines[y]
+
+        # Apply selection highlighting when a span intersects this line.
+        if selection is not None:
+            span = selection.get_span(y)
+            if span is not None:
+                start, end = span
+                selection_style = self.screen.get_component_rich_style(
+                    "screen--selection"
+                )
+                # Rebuild segments with the selection style applied.
+                new_segments: list[Segment] = []
+                col = 0
+                for seg in raw_strip._segments:
+                    seg_len = cell_len(seg.text)
+                    seg_end = col + seg_len
+                    actual_end = end if end != -1 else seg_end
+                    if col < actual_end and seg_end > start:
+                        # This segment overlaps the selection.
+                        combined = seg.style + selection_style if seg.style else selection_style
+                        new_segments.append(Segment(seg.text, combined))
+                    else:
+                        new_segments.append(seg)
+                    col = seg_end
+                raw_strip = Strip(new_segments, raw_strip.cell_length)
+
+        line = raw_strip.crop_extend(scroll_x, scroll_x + width, self.rich_style)
+        # apply_offsets embeds (x, y) metadata so Textual can map mouse
+        # positions back to text coordinates during selection.
+        line = line.apply_offsets(scroll_x, y)
+
+        if selection is None:
+            key = (y + self._start_line, scroll_x, width, self._widest_line_width)
+            self._line_cache[key] = line
+        return line
 
     def _color_for_user(self, user_id: str) -> str:
         """Assign a consistent color to each user."""
@@ -228,11 +366,7 @@ class MessageView(RichLog):
 
     def on_click(self, event: Click) -> None:
         """Handle clicks on links and image view buttons."""
-        import logging
-        log = logging.getLogger(__name__)
         style = event.style
-        log.debug("Click at (%s,%s) style.link=%s", event.x, event.y,
-                   getattr(style, 'link', None) if style else None)
         if not style or not style.link:
             return
 
@@ -240,7 +374,10 @@ class MessageView(RichLog):
             encoded = style.link[len(_LINK_PREFIX):]
             try:
                 url = urlsafe_b64decode(encoded.encode()).decode()
-                webbrowser.open(url)
+                # Only open http/https URLs to prevent command injection
+                # via file://, javascript:, or other dangerous schemes
+                if url.startswith("https://") or url.startswith("http://"):
+                    webbrowser.open(url)
             except Exception:
                 pass
         elif style.link.startswith(_IMAGE_PREFIX):
@@ -267,9 +404,12 @@ class MessageView(RichLog):
         data = self._image_cache.get(file_id)
         if not data:
             return
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        # Use a stable path per file_id so repeated opens don't accumulate temp files
+        tmp_dir = os.path.join(tempfile.gettempdir(), "slack-tui-images")
+        os.makedirs(tmp_dir, exist_ok=True)
+        path = os.path.join(tmp_dir, f"{file_id}.png")
+        with open(path, "wb") as f:
             f.write(data)
-            path = f.name
         # Try dedicated image viewers first, fall back to xdg-open
         viewers = ["eog", "feh", "display", "sxiv", "imv", "xdg-open"]
         for viewer in viewers:
@@ -297,7 +437,7 @@ class MessageView(RichLog):
         """Format and display a single message."""
         self._maybe_write_date_separator(message)
 
-        time_str = datetime.fromtimestamp(message.timestamp).strftime("%H:%M")
+        time_str = _format_relative_time(message.timestamp)
         color = self._color_for_user(message.user_id)
         continuation = self._is_continuation(message)
 
@@ -353,6 +493,18 @@ class MessageView(RichLog):
                 ),
             )
             self.write(thread_line)
+        elif not self._in_thread_view and not message.thread_ts:
+            # Show "Reply in Thread" CTA for messages that aren't already
+            # part of a thread and aren't displayed inside thread view.
+            reply_line = Text()
+            reply_line.append(
+                "    \u21a9",
+                style=Style(
+                    color="blue", dim=True, underline=True,
+                    link=f"{_THREAD_PREFIX}{message.ts}",
+                ),
+            )
+            self.write(reply_line)
 
     def show_thread_header(self, parent_text: str) -> None:
         """Show a header indicating we're in thread view mode."""
@@ -360,6 +512,7 @@ class MessageView(RichLog):
         self._last_date_label = None
         self._last_user_id = None
         self._last_timestamp = 0.0
+        self._in_thread_view = True
         # Clickable "< Close Thread" link at the top
         close_line = Text()
         close_line.append(
@@ -387,6 +540,7 @@ class MessageView(RichLog):
         self._last_date_label = None
         self._last_user_id = None
         self._last_timestamp = 0.0
+        self._in_thread_view = False
         for msg in messages:
             self.append_message(msg)
 
@@ -412,7 +566,7 @@ class MessageView(RichLog):
             return
 
         for result in results:
-            time_str = datetime.fromtimestamp(result.timestamp).strftime("%Y-%m-%d %H:%M")
+            time_str = _format_relative_time(result.timestamp)
 
             # Channel name as a clickable link to navigate
             encoded_id = urlsafe_b64encode(result.channel_id.encode()).decode()

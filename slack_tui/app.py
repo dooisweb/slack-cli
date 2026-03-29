@@ -11,6 +11,8 @@ from textual.message import Message as TextualMessage
 from textual.widgets import Footer, Header
 from textual.worker import Worker, WorkerState
 
+import emoji as emoji_lib
+
 from slack_tui import cache as disk_cache
 from slack_tui.config import SlackConfig, load_config, save_config
 from slack_tui.models import Channel, ChannelType, FileAttachment, Message
@@ -327,12 +329,17 @@ class SlackTuiApp(App):
 
     def _get_completions(self, text: str) -> list[tuple[str, str]]:
         """Return (completion_text, description) pairs for the given input."""
+        # Check for emoji shortcode anywhere in text (e.g., "hello :thu")
+        emoji_results = self._complete_emoji(text)
+        if emoji_results:
+            return emoji_results
+
         parts = text.split(None, 1)
         cmd = parts[0].lower() if parts else ""
         arg = parts[1].strip() if len(parts) > 1 else ""
 
         # Still typing the command name (no space yet)
-        if len(parts) <= 1:
+        if len(parts) <= 1 and text.startswith("/"):
             return [(c, d) for c, d in COMMANDS if c.startswith(cmd)]
 
         # Command is complete, provide argument completions
@@ -340,6 +347,30 @@ class SlackTuiApp(App):
             return self._complete_channel_name(arg)
 
         return []
+
+    def _complete_emoji(self, text: str) -> list[tuple[str, str]]:
+        """Return emoji completions if the user is typing a :shortcode."""
+        colon_pos = text.rfind(":")
+        if colon_pos == -1:
+            return []
+        fragment = text[colon_pos:]
+        if " " in fragment or len(fragment) < 3:
+            return []
+        if fragment.count(":") >= 2:
+            return []
+        search = fragment[1:].lower()
+        results: list[tuple[str, str]] = []
+        for char, data in emoji_lib.EMOJI_DATA.items():
+            name = data.get("en", "").strip(":")
+            aliases = [a.strip(":") for a in data.get("alias", [])]
+            all_names = [name] + aliases
+            for n in all_names:
+                if n.startswith(search):
+                    results.append((char, f":{n}:"))
+                    break
+            if len(results) >= 8:
+                break
+        return results
 
     def _complete_channel_name(self, prefix: str) -> list[tuple[str, str]]:
         """Return channel/user completions for /msg."""

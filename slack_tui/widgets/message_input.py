@@ -37,9 +37,24 @@ class MessageInput(Input):
     def autocomplete_active(self, value: bool) -> None:
         self._autocomplete_active = value
 
+    def _find_emoji_prefix(self, text: str, cursor: int) -> str | None:
+        """Check if cursor is inside an emoji shortcode like ':thumb'."""
+        # Search backwards from cursor for an opening ':'
+        left = text[:cursor]
+        colon_pos = left.rfind(":")
+        if colon_pos == -1:
+            return None
+        fragment = left[colon_pos:]
+        # Must be :word_chars with no spaces, at least 2 chars after :
+        if " " in fragment or len(fragment) < 3:
+            return None
+        return fragment
+
     def on_input_changed(self, event: Input.Changed) -> None:
         text = event.value
         if text.startswith("/"):
+            self.post_message(self.AutocompleteRequest(text))
+        elif self._find_emoji_prefix(text, self.cursor_position):
             self.post_message(self.AutocompleteRequest(text))
         else:
             self.post_message(self.AutocompleteDismiss())
@@ -67,8 +82,18 @@ class MessageInput(Input):
                 dropdown = self.screen.query_one("#autocomplete", AutocompleteDropdown)
                 selected = dropdown.select_current()
                 if selected:
-                    self.value = selected + " "
-                    self.cursor_position = len(self.value)
+                    # Check if we're completing an emoji (selected is a unicode char)
+                    emoji_prefix = self._find_emoji_prefix(self.value, self.cursor_position)
+                    if emoji_prefix and not selected.startswith("/"):
+                        # Replace the :shortcode with the emoji character
+                        left = self.value[:self.cursor_position]
+                        right = self.value[self.cursor_position:]
+                        colon_pos = left.rfind(":")
+                        self.value = left[:colon_pos] + selected + " " + right
+                        self.cursor_position = colon_pos + len(selected) + 1
+                    else:
+                        self.value = selected + " "
+                        self.cursor_position = len(self.value)
                     self.post_message(self.AutocompleteRequest(self.value))
                 return
             elif event.key == "escape":
